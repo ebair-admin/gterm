@@ -106,9 +106,11 @@ targets:
       - sdk: CoreText.framework
       - sdk: CoreGraphics.framework
 
-  # Logic-only test bundle for the LLM autocompletion core. It compiles the
-  # Foundation-only Sources/LLM files directly (no GhosttyKit / UIKit), so the
-  # tests are fast and hermetic and need no host app.
+  # Logic-only test bundle for the LLM autocompletion core and the herdr
+  # protocol client. It compiles the Foundation-only Sources/LLM and
+  # Sources/Herdr files directly (no GhosttyKit / UIKit / NIO), so the tests
+  # are fast and hermetic and need no host app. The NIO-carrying half of the
+  # herdr bridge lives in Sources/SSH and stays out of this target on purpose.
   gtermTests:
     type: bundle.unit-test
     platform: iOS
@@ -116,6 +118,7 @@ targets:
     sources:
       - path: Tests
       - path: Sources/LLM
+      - path: Sources/Herdr
     dependencies:
       - package: OpenAI
       - package: SwiftAnthropic
