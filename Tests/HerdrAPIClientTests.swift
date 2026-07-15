@@ -79,13 +79,16 @@ final class HerdrAPIClientTests: XCTestCase {
     func testOutOfOrderResponsesResolveCorrectly() async throws {
         let transport = MockHerdrTransport()
         let client = HerdrAPIClient(transport: transport)
-        // No auto-responder: capture ids, answer in reverse order.
+        // No auto-responder: capture ids, answer in reverse order. Match the
+        // requests by METHOD — `async let` does not guarantee send order.
         async let first: HerdrPong = client.request("ping", params: EmptyParams())
         async let second: AgentListResult = client.request("agent.list", params: EmptyParams())
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(transport.sent.count, 2)
-        transport.respond(to: transport.sent[1].line, result: #"{"type":"agent_list","agents":[]}"#)
-        transport.respond(to: transport.sent[0].line, result: #"{"type":"pong","protocol":16}"#)
+        let pingLine = try XCTUnwrap(transport.sent.first { MockHerdrTransport.method(of: $0.line) == "ping" }?.line)
+        let listLine = try XCTUnwrap(transport.sent.first { MockHerdrTransport.method(of: $0.line) == "agent.list" }?.line)
+        transport.respond(to: listLine, result: #"{"type":"agent_list","agents":[]}"#)
+        transport.respond(to: pingLine, result: #"{"type":"pong","protocol":16}"#)
         let (pong, list) = try await (first, second)
         XCTAssertEqual(pong.proto, 16)
         XCTAssertTrue(list.agents.isEmpty)

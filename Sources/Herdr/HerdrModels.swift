@@ -313,6 +313,38 @@ struct AgentInfo: Decodable, Equatable, Sendable {
     var displayName: String {
         name ?? agent ?? title ?? paneID
     }
+
+    /// Merge a pane_agent_status_changed delta onto a full record. Verified
+    /// against the live schema (protocol 16): the event carries pane_id,
+    /// workspace_id, agent_status (+ optional agent/title) and NEVER
+    /// terminal_id/tab_id/focused/cwd — so those always keep the list value.
+    /// Status always overwrites (it is the point of the event); agent/title
+    /// overwrite only when the event actually carries them (a null in the
+    /// event means "not reported", not "cleared").
+    func merging(_ delta: AgentInfo) -> AgentInfo {
+        AgentInfo(
+            terminalID: terminalID,
+            name: delta.name ?? name,
+            agent: delta.agent ?? agent,
+            title: delta.title ?? title,
+            status: delta.status,
+            workspaceID: delta.workspaceID.isEmpty ? workspaceID : delta.workspaceID,
+            tabID: tabID,
+            paneID: paneID,
+            focused: focused,
+            cwd: cwd
+        )
+    }
+
+    /// Copy with a new focus flag (driven by pane_focused events, the only
+    /// place focus changes are reported).
+    func withFocus(_ focused: Bool) -> AgentInfo {
+        AgentInfo(
+            terminalID: terminalID, name: name, agent: agent, title: title,
+            status: status, workspaceID: workspaceID, tabID: tabID,
+            paneID: paneID, focused: focused, cwd: cwd
+        )
+    }
 }
 
 // MARK: - Per-method result payloads
