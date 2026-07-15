@@ -17,6 +17,12 @@ struct SSHConnection: Identifiable {
     /// saved host. Not persisted; rides along so the UI can resolve persisted
     /// port forwards for this connection.
     var savedID: UUID? = nil
+    /// Optional per-host command sent to the PTY once the shell is up
+    /// (e.g. "herdr"). nil = plain login shell, as before.
+    var runOnConnect: String? = nil
+    /// Optional per-host override for herdr's API socket path. nil = the
+    /// bridge default (${XDG_CONFIG_HOME:-$HOME/.config}/herdr/herdr.sock).
+    var herdrSocketPath: String? = nil
 }
 
 /// High-level lifecycle of an SSH session, surfaced to the UI.
@@ -131,6 +137,7 @@ final class SSHSession: TerminalSession {
         // next session's bind fails with EADDRINUSE.
         let cleanup = forwardManager?.stopAll() ?? group.next().makeSucceededVoidFuture()
         forwardManager = nil
+        stopHerdrBridge()
         let child = childChannel
         let parent = channel
         childChannel = nil
@@ -235,6 +242,37 @@ final class SSHSession: TerminalSession {
             }
         }
         return resultPromise.futureResult
+    }
+
+    // MARK: herdr bridge
+
+    private var herdrBridge: HerdrBridgeChannel?
+
+    /// Build a herdr transport on the authenticated parent channel + the shared
+    /// single-threaded group — same shape and threading invariant as
+    /// PortForwardManager. Returns nil unless connected. The CALLER owns the
+    /// client/store built on top; `stopHerdrBridge()` tears down only the
+    /// bridge's exec child channels — the PTY and the parent stay up (spec §2:
+    /// bridge failure must never take the terminal down).
+    func makeHerdrTransport(socketPath: String?) -> HerdrBridgeChannel? {
+        guard let channel else { return nil }
+        var config = HerdrBridgeConfig()
+        if let socketPath, !socketPath.isEmpty {
+            config.socketPath = socketPath
+        }
+        let bridge = HerdrBridgeChannel(parentChannel: channel, group: group, config: config)
+        herdrBridge = bridge
+        return bridge
+    }
+
+    /// Close the bridge's exec child channels; the terminal keeps running.
+    /// Safe to call twice (the store's stop also disconnects the client).
+    func stopHerdrBridge() {
+        guard let bridge = herdrBridge else { return }
+        herdrBridge = nil
+        // The event loop is still alive here (stop() shuts the group down
+        // afterwards), so the async disconnect lands before teardown.
+        Task { await bridge.disconnect() }
     }
 
     // MARK: Port forwarding

@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 /// A pending host-key trust decision surfaced to the UI, pairing the prompt
@@ -33,6 +34,13 @@ struct TerminalScreen: View {
     @State private var browsing: PortForward?
     /// A URL tapped in the terminal, opened in the in-app browser.
     @State private var linkURL: TappedURL?
+    /// Herd view: created only after SSH connects (the bridge needs the
+    /// authenticated channel); the sidebar affordance appears only once the
+    /// version gate passes (spec §2 — never render on an unverified protocol).
+    @State private var herdStore: HerdrSessionStore?
+    @State private var herdPhase: HerdrSessionStore.Phase = .idle
+    @State private var herdSidebarOpen = false
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     /// Persisted forward configs for this connection (empty if not a saved host).
     private var connectionForwards: [PortForward] {
@@ -43,24 +51,61 @@ struct TerminalScreen: View {
     var body: some View {
         VStack(spacing: 0) {
             statusBar
-            TerminalView(ghostty: ghostty, makeSession: { view in
-                SSHSession(
-                    connection: connection,
-                    view: view,
-                    forwards: connectionForwards,
-                    onHostKeyPrompt: { prompt, decide in
-                        hostKeyRequest = HostKeyPromptRequest(prompt: prompt, decide: decide)
-                    },
-                    onForwardChange: { id, st in forwardStates[id] = st }
-                ) { newState in
-                    state = newState
+            HStack(spacing: 0) {
+                // iPad (regular width): persistent sidebar column. Once open it
+                // STAYS open across bridge drops — the sidebar shows the
+                // disconnected banner; the terminal is unaffected (spec §2).
+                if horizontalSizeClass == .regular, herdSidebarOpen, let store = herdStore {
+                    AgentSidebarView(store: store)
+                        .frame(width: 300)
+                    Divider()
                 }
-            }, onCreate: { view in
-                view.onOpenURL = { url in linkURL = TappedURL(url: url) }
-                DispatchQueue.main.async { terminalView = view }
-            }, onSession: { s in
-                DispatchQueue.main.async { session = s }
-            })
+                TerminalView(ghostty: ghostty, makeSession: { view in
+                    SSHSession(
+                        connection: connection,
+                        view: view,
+                        forwards: connectionForwards,
+                        onHostKeyPrompt: { prompt, decide in
+                            hostKeyRequest = HostKeyPromptRequest(prompt: prompt, decide: decide)
+                        },
+                        onForwardChange: { id, st in forwardStates[id] = st }
+                    ) { newState in
+                        state = newState
+                        handleSessionState(newState)
+                    }
+                }, onCreate: { view in
+                    view.onOpenURL = { url in linkURL = TappedURL(url: url) }
+                    DispatchQueue.main.async { terminalView = view }
+                }, onSession: { s in
+                    DispatchQueue.main.async {
+                        session = s
+                        maybeStartHerdProbe()
+                    }
+                })
+            }
+        }
+        .overlay(alignment: .leading) {
+            // iPhone (compact width): slide-over drawer from the leading edge.
+            if horizontalSizeClass == .compact, herdSidebarOpen, let store = herdStore {
+                ZStack(alignment: .leading) {
+                    Color.black.opacity(0.35)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            withAnimation { herdSidebarOpen = false }
+                        }
+                    AgentSidebarView(store: store, onClose: {
+                        withAnimation { herdSidebarOpen = false }
+                    })
+                    .frame(width: 300)
+                }
+                .transition(.move(edge: .leading))
+            }
+        }
+        .onReceive((herdStore?.$phase)?.eraseToAnyPublisher() ?? Empty(completeImmediately: false).eraseToAnyPublisher()) { phase in
+            herdPhase = phase
+        }
+        .onDisappear {
+            herdStore?.stop()
         }
         .sheet(isPresented: $showingAICommands) {
             AICommandSheet(
@@ -115,6 +160,36 @@ struct TerminalScreen: View {
         }
     }
 
+    // MARK: - Herd view
+
+    /// React to SSH lifecycle: start the bridge probe once connected; tear the
+    /// store down with the session (spec Phase 2.3 — the bridge's lifecycle is
+    /// the session's).
+    private func handleSessionState(_ newState: SSHSessionState) {
+        switch newState {
+        case .connected:
+            maybeStartHerdProbe()
+        case .failed, .closed:
+            herdStore?.stop()
+            herdStore = nil
+            herdSidebarOpen = false
+        default:
+            break
+        }
+    }
+
+    /// Start the herdr bridge probe. Runs at most once per session; both the
+    /// session-object delivery and the connected-state transition call it
+    /// (order between the two is not guaranteed). If the probe never opens
+    /// (no herdr on the host), nothing appears and the terminal is unchanged.
+    private func maybeStartHerdProbe() {
+        guard herdStore == nil, let session, state == .connected else { return }
+        guard let transport = session.makeHerdrTransport(socketPath: connection.herdrSocketPath) else { return }
+        let store = HerdrSessionStore(client: HerdrAPIClient(transport: transport))
+        herdStore = store
+        store.start()
+    }
+
     private func hostKeyMessage(_ prompt: HostKeyPrompt) -> String {
         switch prompt.kind {
         case .firstUse:
@@ -161,6 +236,16 @@ struct TerminalScreen: View {
             }
             .accessibilityLabel("Port forwards")
             .disabled(state != .connected)
+            // Herd affordance: only once the version gate has PASSED (spec §2 —
+            // the sidebar is never rendered on an unverified protocol).
+            if herdPhase == .connected, herdStore != nil {
+                Button {
+                    withAnimation { herdSidebarOpen.toggle() }
+                } label: {
+                    Image(systemName: "square.grid.2x2").font(.body.weight(.semibold))
+                }
+                .accessibilityLabel("Herd agents")
+            }
             statusIndicator
         }
         .padding(.horizontal, 14)
