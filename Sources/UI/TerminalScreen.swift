@@ -40,7 +40,13 @@ struct TerminalScreen: View {
     @State private var herdStore: HerdrSessionStore?
     @State private var herdPhase: HerdrSessionStore.Phase = .idle
     @State private var herdSidebarOpen = false
+    /// The blocked agent the approval sheet is presented for (nil = no sheet).
+    @State private var approvalTarget: AgentInfo?
+    /// paneID the user dismissed WITHOUT acting — don't re-pop for the same
+    /// block; cleared when no agent is blocked so a NEW block re-presents.
+    @State private var dismissedApprovalFor: String?
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.scenePhase) private var scenePhase
 
     /// Persisted forward configs for this connection (empty if not a saved host).
     private var connectionForwards: [PortForward] {
@@ -103,6 +109,40 @@ struct TerminalScreen: View {
         }
         .onReceive((herdStore?.$phase)?.eraseToAnyPublisher() ?? Empty(completeImmediately: false).eraseToAnyPublisher()) { phase in
             herdPhase = phase
+        }
+        .onReceive((herdStore?.$blockedAgent)?.eraseToAnyPublisher() ?? Empty(completeImmediately: false).eraseToAnyPublisher()) { blocked in
+            // Approval trigger (spec 3.2): pane_agent_status_changed → blocked.
+            if let blocked, dismissedApprovalFor != blocked.paneID {
+                approvalTarget = blocked
+            }
+            if blocked == nil {
+                dismissedApprovalFor = nil
+            }
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            // Foreground resync (spec 3.3): iOS suspends sockets in the
+            // background, so the moment we return is the only chance to catch
+            // up — then notify if anything is waiting for a decision.
+            guard newPhase == .active, let store = herdStore, store.phase == .connected else { return }
+            Task { @MainActor in
+                await store.resync()
+                if let blocked = store.blockedAgent {
+                    ApprovalNotifier.notifyBlocked(agent: blocked)
+                }
+            }
+        }
+        .sheet(item: $approvalTarget, onDismiss: {
+            dismissedApprovalFor = approvalTarget?.paneID
+        }) { agent in
+            if let store = herdStore {
+                ApprovalSheet(agent: agent, store: store) { toFocus in
+                    store.focus(agent: toFocus)
+                    herdSidebarOpen = false
+                }
+            }
+        }
+        .onAppear {
+            ApprovalNotifier.install()
         }
         .onDisappear {
             herdStore?.stop()

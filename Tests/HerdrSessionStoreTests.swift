@@ -7,7 +7,7 @@ final class HerdrSessionStoreTests: XCTestCase {
     /// Three panes across two workspaces, deliberately unordered, to prove the
     /// stable sort (workspace, then display name): Alpha (w1:p1, blocked,
     /// focused) → Bravo (w1:p2, working) → zeta (w2:p1, idle).
-    private let agentsFixture = #"[{"pane_id":"w2:p1","agent":"zeta","agent_status":"idle","workspace_id":"w2","tab_id":"w2:t1","focused":false},{"pane_id":"w1:p2","agent":"beta","name":"Bravo","agent_status":"working","workspace_id":"w1","tab_id":"w1:t2","focused":false},{"pane_id":"w1:p1","agent":"alpha","name":"Alpha","agent_status":"blocked","workspace_id":"w1","tab_id":"w1:t1","focused":true}]"#
+    private let agentsFixture = #"[{"pane_id":"w2:p1","agent":"zeta","agent_status":"idle","workspace_id":"w2","tab_id":"w2:t1","focused":false},{"pane_id":"w1:p2","agent":"beta","name":"Bravo","agent_status":"working","workspace_id":"w1","tab_id":"w1:t2","focused":false},{"pane_id":"w1:p1","agent":"claude","name":"Alpha","agent_status":"blocked","workspace_id":"w1","tab_id":"w1:t1","focused":true}]"#
 
     private func statusEvent(_ paneID: String, _ workspaceID: String, _ status: String, extra: String = "") -> String {
         #"{"event":"pane_agent_status_changed","data":{"type":"pane_agent_status_changed","pane_id":"\#(paneID)","workspace_id":"\#(workspaceID)","agent_status":"\#(status)"\#(extra)}}"#
@@ -149,6 +149,94 @@ final class HerdrSessionStoreTests: XCTestCase {
         let focusLine = transport.sent.first { MockHerdrTransport.method(of: $0.line) == "agent.focus" }?.line
         let line = try XCTUnwrap(focusLine)
         XCTAssertTrue(line.contains("\"target\":\"w1:p1\""))
+        store.stop()
+    }
+
+    // MARK: - Approval intents (§2.7 safety sequence)
+
+    /// Rewires the mock to answer the approval-path methods. `getStatus` is
+    /// what agent.get reports for w1:p1 (the flap tests set it non-blocked).
+    private func approvalResponder(_ transport: MockHerdrTransport, getStatus: String = "blocked") {
+        transport.onSend = { line, _ in
+            switch MockHerdrTransport.method(of: line) {
+            case "agent.get":
+                transport.respond(to: line, result: """
+                {"type":"agent_info","agent":{"pane_id":"w1:p1","agent":"claude","agent_status":"\(getStatus)","workspace_id":"w1","tab_id":"w1:t1","focused":true}}
+                """)
+            case "pane.send_keys":
+                transport.respond(to: line, result: #"{"type":"ok"}"#)
+            case "agent.read":
+                transport.respond(to: line, result: #"{"type":"pane_read","read":{"text":"Allow Bash tool?","truncated":false}}"#)
+            default:
+                break
+            }
+        }
+    }
+
+    private func sendKeysLines(_ transport: MockHerdrTransport) -> [String] {
+        transport.sent.filter { MockHerdrTransport.method(of: $0.line) == "pane.send_keys" }.map(\.line)
+    }
+
+    func testApproveReVerifiesThenSendsApproveKeys() async throws {
+        let (store, transport) = try await makeConnectedStore()
+        approvalResponder(transport)
+        let alpha = try XCTUnwrap(store.agents.first { $0.paneID == "w1:p1" })
+
+        let outcome = await store.approve(agent: alpha)
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(store.approvalPending, "w1:p1")
+        let keys = try XCTUnwrap(sendKeysLines(transport).first)
+        XCTAssertTrue(keys.contains("\"pane_id\":\"w1:p1\""))
+        XCTAssertTrue(keys.contains("\"Enter\"")) // claude keymap approve
+
+        // The optimistic pending clears on the confirming status event.
+        transport.emitLine(statusEvent("w1:p1", "w1", "working"))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(store.approvalPending)
+        store.stop()
+    }
+
+    func testDenySendsDenyKeys() async throws {
+        let (store, transport) = try await makeConnectedStore()
+        approvalResponder(transport)
+        let alpha = try XCTUnwrap(store.agents.first { $0.paneID == "w1:p1" })
+        let outcome = await store.deny(agent: alpha)
+        XCTAssertEqual(outcome, .sent)
+        let keys = try XCTUnwrap(sendKeysLines(transport).first)
+        XCTAssertTrue(keys.contains("\"Escape\"")) // claude keymap deny
+        store.stop()
+    }
+
+    /// The §2.7 flap case: the agent un-blocked between sheet-open and tap —
+    /// the re-fetch must catch it and NOTHING may be sent.
+    func testStatusFlapBetweenOpenAndTapPreventsBlindSend() async throws {
+        let (store, transport) = try await makeConnectedStore()
+        approvalResponder(transport, getStatus: "working") // no longer blocked
+        let alpha = try XCTUnwrap(store.agents.first { $0.paneID == "w1:p1" })
+        let outcome = await store.approve(agent: alpha)
+        XCTAssertEqual(outcome, .stateChanged)
+        XCTAssertTrue(sendKeysLines(transport).isEmpty)
+        XCTAssertNil(store.approvalPending)
+        store.stop()
+    }
+
+    /// Unknown agent → no keymap → no buttons, nothing sent (§3.1).
+    func testUnknownAgentHasNoKeymapAndSendsNothing() async throws {
+        let (store, transport) = try await makeConnectedStore()
+        approvalResponder(transport)
+        let beta = try XCTUnwrap(store.agents.first { $0.paneID == "w1:p2" }) // agent "beta"
+        let outcome = await store.approve(agent: beta)
+        XCTAssertEqual(outcome, .noKeymap)
+        XCTAssertTrue(sendKeysLines(transport).isEmpty)
+        store.stop()
+    }
+
+    func testReadPromptReturnsNestedPaneReadText() async throws {
+        let (store, transport) = try await makeConnectedStore()
+        approvalResponder(transport)
+        let alpha = try XCTUnwrap(store.agents.first { $0.paneID == "w1:p1" })
+        let text = await store.readPrompt(agent: alpha)
+        XCTAssertEqual(text, "Allow Bash tool?") // from result.read.text, not top level
         store.stop()
     }
 }

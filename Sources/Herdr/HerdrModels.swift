@@ -366,11 +366,32 @@ struct AgentGetResult: Decodable {
     let agent: AgentInfo?
 }
 
-/// agent.read result. Only `text` is used by the UI (approval sheet body);
+/// agent.read result ENVELOPE (live schema protocol 16):
+/// {"type":"pane_read","read":{...}} — the payload nests under `read`.
+/// Decoding the payload from the top level would silently yield empty text.
+struct AgentReadResult: Decodable {
+    let read: PaneReadResult
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        read = (try? c.decode(PaneReadResult.self, forKey: .read)) ?? PaneReadResult(text: "", truncated: false)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case read
+    }
+}
+
+/// agent.read payload. Only `text` is used by the UI (approval sheet body);
 /// the rest is metadata we may log — never the text itself (secrets, spec §2).
 struct PaneReadResult: Decodable {
     let text: String
     let truncated: Bool
+
+    init(text: String, truncated: Bool) {
+        self.text = text
+        self.truncated = truncated
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)

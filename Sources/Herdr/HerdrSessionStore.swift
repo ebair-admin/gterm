@@ -87,6 +87,7 @@ final class HerdrSessionStore: ObservableObject {
         phase = .idle
         agents = []
         blockedAgent = nil
+        approvalPending = nil
     }
 
     // MARK: - Intents
@@ -105,9 +106,78 @@ final class HerdrSessionStore: ObservableObject {
         }
     }
 
-    // approve(agent:) / deny(agent:) land in Phase 3: they need the per-agent
-    // keymaps (§3.1) and the §2.7 safety sequence (re-verify still blocked via
-    // agent.get BEFORE any key injection; show the prompt text first).
+    // MARK: - Approval intents (spec §2.7 safety sequence)
+
+    /// Outcome of an approve/deny attempt.
+    enum ApprovalOutcome: Equatable {
+        /// Keys injected; awaiting the confirming status event.
+        case sent
+        /// The agent was no longer blocked when re-checked — the UI must say
+        /// "state changed, review again", NEVER blind-send (spec §2.7).
+        case stateChanged
+        /// Unknown agent: no keymap, no buttons — "open terminal to respond".
+        case noKeymap
+        /// Transport/remote failure; metadata only, never pane content.
+        case failed(String)
+    }
+
+    /// paneID with an answer in flight (sheet shows pending; cleared by the
+    /// confirming status event or a resync).
+    @Published private(set) var approvalPending: String?
+
+    func approve(agent: AgentInfo) async -> ApprovalOutcome {
+        await answer(agent) { $0.approve }
+    }
+
+    func deny(agent: AgentInfo) async -> ApprovalOutcome {
+        await answer(agent) { $0.deny }
+    }
+
+    /// The §2.7 sequence: keymap lookup → RE-FETCH agent.get and confirm the
+    /// status is STILL blocked → only then pane.send_keys → optimistic
+    /// pending, confirmed by the next status event (see apply(_:)). No
+    /// auto-approve logic of any kind.
+    private func answer(_ agent: AgentInfo, keys: (AgentKeymap) -> [String]) async -> ApprovalOutcome {
+        guard let keymap = AgentKeymaps.keymap(for: agent.agent) else {
+            return .noKeymap
+        }
+        do {
+            let fresh: AgentGetResult = try await client.request(
+                "agent.get", params: AgentTargetParams(target: agent.paneID))
+            guard fresh.agent?.status == .blocked else {
+                return .stateChanged
+            }
+            let _: HerdrAckResult = try await client.request(
+                "pane.send_keys",
+                params: PaneSendKeysParams(paneID: agent.paneID, keys: keys(keymap)))
+            approvalPending = agent.paneID
+            return .sent
+        } catch {
+            log.notice("approval answer failed: \(String(describing: error), privacy: .public)")
+            return .failed(String(describing: error))
+        }
+    }
+
+    /// The prompt text the user is being asked about (approval sheet body).
+    /// agent.read with strip_ansi — the text is shown verbatim, never logged
+    /// (pane content contains secrets, spec §2.7). nil on failure.
+    func readPrompt(agent: AgentInfo) async -> String? {
+        do {
+            let result: AgentReadResult = try await client.request(
+                "agent.read", params: AgentReadParams(target: agent.paneID))
+            return result.read.text
+        } catch {
+            log.notice("agent.read failed: \(String(describing: error), privacy: .public)")
+            return nil
+        }
+    }
+
+    /// Force a resync (spec Phase 3.3: foreground refresh). Awaits the round
+    /// trip so callers can act on the fresh list (e.g. local notification).
+    func resync() async {
+        scheduleResync()
+        await resyncTask?.value
+    }
 
     // MARK: - Client state → phase
 
@@ -140,6 +210,11 @@ final class HerdrSessionStore: ObservableObject {
                 return
             }
             agents[idx] = agents[idx].merging(delta)
+            // The confirmation half of the optimistic pending (§3.2): any
+            // status event for the answered pane ends the wait.
+            if approvalPending == delta.paneID, delta.status != .blocked {
+                approvalPending = nil
+            }
             recomputeBlocked()
         case .paneCreated:
             // Also extends the PER-PANE subscription set to the new pane —
@@ -147,6 +222,7 @@ final class HerdrSessionStore: ObservableObject {
             scheduleResync()
         case .paneClosed(let paneID, _):
             agents.removeAll { $0.paneID == paneID }
+            if approvalPending == paneID { approvalPending = nil }
             recomputeBlocked()
         case .paneFocused(let paneID, _):
             agents = agents.map { $0.withFocus($0.paneID == paneID) }
