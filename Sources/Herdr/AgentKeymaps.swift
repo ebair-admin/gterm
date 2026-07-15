@@ -23,6 +23,11 @@ enum AgentKeymaps {
         // Claude Code permission prompt: Enter accepts the highlighted
         // default (Yes), Escape rejects.
         "claude": AgentKeymap(approve: ["Enter"], deny: ["Escape"]),
+        // kimi-code approval panel (verified live 2026-07-15 on oracle, kimi
+        // 0.24.x): "▶ 1. Approve once / 2. Approve for this session /
+        // 3. Reject / 4. Reject with feedback — 1/2/3/4 choose". The number
+        // keys select directly; no navigation needed.
+        "kimi": AgentKeymap(approve: ["1"], deny: ["3"]),
     ]
 
     /// The keymap for an agent id (case-insensitive). nil means "we don't
