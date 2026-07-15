@@ -16,6 +16,12 @@ final class PTYChannelHandler: ChannelDuplexHandler {
     private let term: String
     private var cols: Int
     private var rows: Int
+    /// Optional command injected as user input ONCE, when the remote shell
+    /// first prints output — the only reliable "shell is up" signal (a fixed
+    /// delay would race slow logins). Used for per-host run-on-connect
+    /// commands like starting herdr (spec Phase 2.4).
+    private let runOnConnect: String?
+    private var didInjectRunOnConnect = false
     /// Called with bytes received from the server. Invoked on the channel's
     /// event loop.
     private let onOutput: (ByteBuffer) -> Void
@@ -28,12 +34,14 @@ final class PTYChannelHandler: ChannelDuplexHandler {
         term: String,
         cols: Int,
         rows: Int,
+        runOnConnect: String? = nil,
         onOutput: @escaping (ByteBuffer) -> Void,
         onClose: @escaping (Error?) -> Void
     ) {
         self.term = term
         self.cols = max(cols, 1)
         self.rows = max(rows, 1)
+        self.runOnConnect = runOnConnect
         self.onOutput = onOutput
         self.onClose = onClose
     }
@@ -76,6 +84,18 @@ final class PTYChannelHandler: ChannelDuplexHandler {
         // We treat both stdout (.channel) and stderr (.stdErr) as terminal
         // output; a PTY shell normally merges them anyway.
         onOutput(buf)
+        injectRunOnConnectIfNeeded(context: context)
+    }
+
+    /// The shell's first output (banner/prompt) proves it is up and reading;
+    /// inject the run-on-connect command as if the user typed it. Once only.
+    private func injectRunOnConnectIfNeeded(context: ChannelHandlerContext) {
+        guard !didInjectRunOnConnect, let runOnConnect, !runOnConnect.isEmpty else { return }
+        didInjectRunOnConnect = true
+        var buf = context.channel.allocator.buffer(capacity: runOnConnect.utf8.count + 1)
+        buf.writeString(runOnConnect)
+        buf.writeString("\n")
+        context.writeAndFlush(wrapOutboundOut(SSHChannelData(type: .channel, data: .byteBuffer(buf))), promise: nil)
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {

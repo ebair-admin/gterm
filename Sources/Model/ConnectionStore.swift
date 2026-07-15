@@ -13,6 +13,13 @@ struct SavedConnection: Identifiable, Codable, Equatable {
     var keyIDs: [UUID] = []
     /// Whether a password is saved in the Keychain for this connection.
     var savePassword: Bool = false
+    /// Optional command sent to the shell once it is up (e.g. "herdr" — the
+    /// Herd view's launch story; gterm has no startup-command feature, the PTY
+    /// otherwise opens a plain login shell).
+    var runOnConnect: String? = nil
+    /// Optional per-host override for herdr's API socket path (HERDR_SOCKET_PATH
+    /// is not reliably present in a non-login exec shell, so the app carries it).
+    var herdrSocketPath: String? = nil
 
     var title: String { name.isEmpty ? "\(username)@\(host)" : name }
 

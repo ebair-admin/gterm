@@ -74,6 +74,17 @@ struct AddConnectionView: View {
                     Toggle("Save password", isOn: $connection.savePassword)
                 }
 
+                Section {
+                    TextField("run on connect (optional)", text: optionalText(\.runOnConnect))
+                        .autocorrectionDisabled().textInputAutocapitalization(.never)
+                    TextField("herdr socket path (optional)", text: optionalText(\.herdrSocketPath))
+                        .autocorrectionDisabled().textInputAutocapitalization(.never)
+                } header: {
+                    Text("Herd view (herdr)")
+                } footer: {
+                    Text("If this host runs herdr: \"run on connect\" starts it in the terminal (e.g. herdr), and the socket path overrides the default ~/.config/herdr/herdr.sock.")
+                }
+
                 Section("Port Forwards") {
                     ForEach(forwardStore.forwards(for: connection.id)) { f in
                         Button {
@@ -128,6 +139,14 @@ struct AddConnectionView: View {
         } else {
             connection.keyIDs.append(id)
         }
+    }
+
+    /// TextField binding for an optional String field: empty text ⇄ nil.
+    private func optionalText(_ keyPath: WritableKeyPath<SavedConnection, String?>) -> Binding<String> {
+        Binding(
+            get: { connection[keyPath: keyPath] ?? "" },
+            set: { connection[keyPath: keyPath] = $0.isEmpty ? nil : $0 }
+        )
     }
 
     private func save() {

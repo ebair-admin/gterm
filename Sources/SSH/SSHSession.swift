@@ -168,6 +168,7 @@ final class SSHSession: TerminalSession {
                         term: self.connection.term,
                         cols: cols,
                         rows: rows,
+                        runOnConnect: self.connection.runOnConnect,
                         onOutput: { [weak self] buf in
                             self?.deliverOutput(buf)
                         },
