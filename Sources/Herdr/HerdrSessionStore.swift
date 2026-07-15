@@ -42,6 +42,12 @@ final class HerdrSessionStore: ObservableObject {
     /// `resyncNeeded` so the loop runs once more with a fresh snapshot.
     private var resyncTask: Task<Void, Never>?
     private var resyncNeeded = false
+    /// Hysteresis for screen-scraped states: herdr's per-frame detection flips
+    /// working↔idle as spinner frames (un)match the manifest rules, which
+    /// makes the sidebar blink. `idle` must be stable for 1 s before it
+    /// applies; every other state applies immediately and cancels the wait.
+    private var pendingIdleTask: [String: Task<Void, Never>] = [:]
+    private var pendingIdleDelta: [String: AgentInfo] = [:]
 
     init(client: HerdrAPIClient) {
         self.client = client
@@ -83,6 +89,9 @@ final class HerdrSessionStore: ObservableObject {
         eventTask = nil
         stateTask = nil
         resyncTask = nil
+        for (_, task) in pendingIdleTask { task.cancel() }
+        pendingIdleTask.removeAll()
+        pendingIdleDelta.removeAll()
         Task { [client] in await client.disconnect() }
         phase = .idle
         agents = []
@@ -203,24 +212,39 @@ final class HerdrSessionStore: ObservableObject {
     private func apply(_ event: HerdrEvent) {
         switch event {
         case .agentStatusChanged(let delta):
-            guard let idx = agents.firstIndex(where: { $0.paneID == delta.paneID }) else {
+            guard agents.contains(where: { $0.paneID == delta.paneID }) else {
                 // A status delta for a pane we don't know: the list is stale
                 // (its pane.created may predate our subscribe ack) — resync.
                 scheduleResync()
                 return
             }
-            agents[idx] = agents[idx].merging(delta)
-            // The confirmation half of the optimistic pending (§3.2): any
-            // status event for the answered pane ends the wait.
-            if approvalPending == delta.paneID, delta.status != .blocked {
-                approvalPending = nil
+            if delta.status == .idle {
+                // Idle is the flickery half of screen-scraped states — apply
+                // it only after it has been stable for a moment (latest wins).
+                pendingIdleDelta[delta.paneID] = delta
+                pendingIdleTask[delta.paneID]?.cancel()
+                pendingIdleTask[delta.paneID] = Task { [weak self] in
+                    try? await Task.sleep(for: .milliseconds(1000))
+                    guard let self, !Task.isCancelled,
+                          let pending = self.pendingIdleDelta.removeValue(forKey: delta.paneID)
+                    else { return }
+                    self.pendingIdleTask.removeValue(forKey: delta.paneID)
+                    self.applyStatusDelta(pending)
+                }
+                return
             }
-            recomputeBlocked()
+            // Any non-idle state is significant on its own (blocked above
+            // all): apply now and drop a pending idle so it can't overwrite.
+            pendingIdleTask.removeValue(forKey: delta.paneID)?.cancel()
+            pendingIdleDelta.removeValue(forKey: delta.paneID)
+            applyStatusDelta(delta)
         case .paneCreated:
             // Also extends the PER-PANE subscription set to the new pane —
             // pane.agent_status_changed has no wildcard (ground-truth #9).
             scheduleResync()
         case .paneClosed(let paneID, _):
+            pendingIdleTask.removeValue(forKey: paneID)?.cancel()
+            pendingIdleDelta.removeValue(forKey: paneID)
             agents.removeAll { $0.paneID == paneID }
             if approvalPending == paneID { approvalPending = nil }
             recomputeBlocked()
@@ -232,8 +256,31 @@ final class HerdrSessionStore: ObservableObject {
         }
     }
 
+    private func applyStatusDelta(_ delta: AgentInfo) {
+        guard let idx = agents.firstIndex(where: { $0.paneID == delta.paneID }) else { return }
+        let merged = agents[idx].merging(delta)
+        // herdr re-emits status on every screen-detection pass (~2.5 Hz
+        // while an agent's UI animates); swallow no-change deltas so
+        // @Published doesn't fan a render storm out to the sidebar/sheet.
+        guard merged != agents[idx] else { return }
+        agents[idx] = merged
+        // The confirmation half of the optimistic pending (§3.2): any
+        // status event for the answered pane ends the wait.
+        if approvalPending == delta.paneID, delta.status != .blocked {
+            approvalPending = nil
+        }
+        recomputeBlocked()
+    }
+
     private func recomputeBlocked() {
-        blockedAgent = agents.first { $0.status == .blocked }
+        let next = agents.first { $0.status == .blocked }
+        // Publish only real transitions: @Published fires on EVERY assignment
+        // (equal values included), and each one re-renders the sidebar and
+        // retriggers the approval sheet's presentation logic.
+        guard next != blockedAgent else { return }
+        let oldID = blockedAgent?.paneID, newID = next?.paneID
+        log.notice("blockedAgent: \(oldID ?? "nil", privacy: .public) → \(newID ?? "nil", privacy: .public)")
+        blockedAgent = next
     }
 
     // MARK: - Resync

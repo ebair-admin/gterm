@@ -1,5 +1,10 @@
 import Combine
 import SwiftUI
+import os
+
+/// Temporary smoke-test breadcrumbs for the approval-sheet presentation path
+/// (metadata only: paneIDs, never pane content). Remove before Phase 4 ship.
+private let herdApprovalLog = Logger(subsystem: "io.github.madeye.gterm", category: "ApprovalUI")
 
 /// A pending host-key trust decision surfaced to the UI, pairing the prompt
 /// details with the callback that resumes the SSH handshake.
@@ -45,6 +50,10 @@ struct TerminalScreen: View {
     /// paneID the user dismissed WITHOUT acting — don't re-pop for the same
     /// block; cleared when no agent is blocked so a NEW block re-presents.
     @State private var dismissedApprovalFor: String?
+    /// paneID currently presented in the sheet. Needed because SwiftUI nils
+    /// `approvalTarget` BEFORE `onDismiss` runs — reading it there would
+    /// always store nil and the sheet would instantly re-pop.
+    @State private var presentedApprovalPaneID: String?
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.scenePhase) private var scenePhase
 
@@ -113,9 +122,14 @@ struct TerminalScreen: View {
         .onReceive((herdStore?.$blockedAgent)?.eraseToAnyPublisher() ?? Empty(completeImmediately: false).eraseToAnyPublisher()) { blocked in
             // Approval trigger (spec 3.2): pane_agent_status_changed → blocked.
             if let blocked, dismissedApprovalFor != blocked.paneID {
+                herdApprovalLog.notice("present sheet for \(blocked.paneID, privacy: .public) (dismissedFor=\(dismissedApprovalFor ?? "none", privacy: .public))")
+                presentedApprovalPaneID = blocked.paneID
                 approvalTarget = blocked
+            } else if let blocked {
+                herdApprovalLog.notice("suppress re-pop for \(blocked.paneID, privacy: .public) (dismissedFor=\(dismissedApprovalFor ?? "none", privacy: .public))")
             }
             if blocked == nil {
+                if dismissedApprovalFor != nil { herdApprovalLog.notice("blockedAgent nil — cleared dismissedFor") }
                 dismissedApprovalFor = nil
             }
         }
@@ -132,7 +146,13 @@ struct TerminalScreen: View {
             }
         }
         .sheet(item: $approvalTarget, onDismiss: {
-            dismissedApprovalFor = approvalTarget?.paneID
+            // SwiftUI delivers spurious onDismiss calls while the item binding
+            // churns — never let an empty read clobber the dedup guard.
+            herdApprovalLog.notice("sheet dismissed — presented=\(presentedApprovalPaneID ?? "nil", privacy: .public)")
+            if let presented = presentedApprovalPaneID {
+                dismissedApprovalFor = presented
+                presentedApprovalPaneID = nil
+            }
         }) { agent in
             if let store = herdStore {
                 ApprovalSheet(agent: agent, store: store) { toFocus in

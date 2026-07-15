@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 
 /// Store tests run on the MainActor (the store is @MainActor) against the
@@ -72,11 +73,65 @@ final class HerdrSessionStoreTests: XCTestCase {
     func testBlockedAgentFollowsStatusFlaps() async throws {
         let (store, transport) = try await makeConnectedStore()
         transport.emitLine(statusEvent("w1:p1", "w1", "idle"))
+        // Idle must prove itself stable for ~1 s first (screen-scrape
+        // hysteresis) — a 100 ms peek still shows the old state.
         try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(store.blockedAgent?.paneID, "w1:p1")
+        try await Task.sleep(for: .milliseconds(1300))
         XCTAssertNil(store.blockedAgent)
         transport.emitLine(statusEvent("w1:p2", "w1", "blocked"))
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(store.blockedAgent?.paneID, "w1:p2")
+        store.stop()
+    }
+
+    func testIdleAppliesOnlyAfterStabilityWindow() async throws {
+        let (store, transport) = try await makeConnectedStore()
+        // w1:p2 starts `working`; a lone idle flicker must not stick.
+        transport.emitLine(statusEvent("w1:p2", "w1", "idle"))
+        try await Task.sleep(for: .milliseconds(150))
+        transport.emitLine(statusEvent("w1:p2", "w1", "working"))
+        try await Task.sleep(for: .milliseconds(1300))
+        XCTAssertEqual(store.agents.first { $0.paneID == "w1:p2" }?.status, .working)
+        // A stable idle does land — just ~1 s late.
+        transport.emitLine(statusEvent("w1:p2", "w1", "idle"))
+        try await Task.sleep(for: .milliseconds(1300))
+        XCTAssertEqual(store.agents.first { $0.paneID == "w1:p2" }?.status, .idle)
+        store.stop()
+    }
+
+    func testBlockedAppliesImmediatelyAndCancelsPendingIdle() async throws {
+        let (store, transport) = try await makeConnectedStore()
+        transport.emitLine(statusEvent("w1:p2", "w1", "idle"))
+        try await Task.sleep(for: .milliseconds(200))
+        transport.emitLine(statusEvent("w1:p2", "w1", "blocked"))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(store.agents.first { $0.paneID == "w1:p2" }?.status, .blocked)
+        // The superseded pending idle must never overwrite the blocked state.
+        try await Task.sleep(for: .milliseconds(1300))
+        XCTAssertEqual(store.agents.first { $0.paneID == "w1:p2" }?.status, .blocked)
+        store.stop()
+    }
+
+    func testIdenticalStatusDeltaDoesNotRepublish() async throws {
+        let (store, transport) = try await makeConnectedStore()
+        var blockedPublishes = 0
+        var agentsPublishes = 0
+        let c1 = store.$blockedAgent.sink { _ in blockedPublishes += 1 }
+        let c2 = store.$agents.sink { _ in agentsPublishes += 1 }
+        // Combine sinks fire once immediately with the current value — that
+        // baseline is 1 for each.
+        XCTAssertEqual(blockedPublishes, 1)
+        XCTAssertEqual(agentsPublishes, 1)
+        // w1:p1 is already blocked: an identical repeat must be swallowed.
+        // herdr re-emits status on every screen-detection pass (~2.5 Hz while
+        // an agent animates); publishing each one fans a render storm out to
+        // the sidebar and re-triggers the approval sheet (smoke-test finding).
+        transport.emitLine(statusEvent("w1:p1", "w1", "blocked"))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(blockedPublishes, 1)
+        XCTAssertEqual(agentsPublishes, 1)
+        _ = (c1, c2)
         store.stop()
     }
 
