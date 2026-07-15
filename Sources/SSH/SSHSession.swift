@@ -198,6 +198,45 @@ final class SSHSession: TerminalSession {
         }
     }
 
+    // MARK: Open an exec child channel (herdr bridge)
+
+    /// Open an exec child channel on the authenticated parent, running `command`
+    /// WITHOUT a PTY. Mirrors `openShellChannel`: same `createChannel(.session)`
+    /// path, but installs `ExecChannelHandler` instead of the PTY handler. The
+    /// herdr bridge (HerdrBridgeChannel) uses this for its request-pump and
+    /// event-stream channels. The caller owns the returned channel — it is not
+    /// tracked here, and closing it never touches the PTY shell or the parent.
+    ///
+    /// - Returns: nil if the session is not connected; otherwise a future that
+    ///   completes with the child channel once the pipeline is installed (the
+    ///   exec request itself is sent on channel activation).
+    func openExecChannel(
+        command: String,
+        onOutput: @escaping (ByteBuffer) -> Void,
+        onExit: @escaping (ExecChannelExit) -> Void
+    ) -> EventLoopFuture<Channel>? {
+        guard let parent = channel else { return nil }
+        let loop = parent.eventLoop
+        let resultPromise = loop.makePromise(of: Channel.self)
+        parent.pipeline.handler(type: NIOSSHHandler.self).whenComplete { result in
+            switch result {
+            case .failure(let error):
+                resultPromise.fail(error)
+            case .success(let sshHandler):
+                let promise = loop.makePromise(of: Channel.self)
+                sshHandler.createChannel(promise, channelType: .session) { childChannel, _ in
+                    let handler = ExecChannelHandler(command: command, onOutput: onOutput, onExit: onExit)
+                    return childChannel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+                        .flatMap {
+                            childChannel.pipeline.addHandler(handler)
+                        }
+                }
+                promise.futureResult.cascade(to: resultPromise)
+            }
+        }
+        return resultPromise.futureResult
+    }
+
     // MARK: Port forwarding
 
     /// Start the listener for the forward with `id` (looked up in the stored
